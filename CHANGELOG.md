@@ -1,5 +1,16 @@
 # Changelog
 
+## v13.2.0 — 2026-09-24
+
+Documentation and scenario-test release. Public financial API unchanged from v13.1.0.
+
+- Production English docs under `docs/` (install → upgrading + API reference)
+- Rewritten `README.md` as a short entry point with documentation index
+- Scenario suite: 15 end-to-end PHP tests + Persian narratives (`tests/Scenarios/`)
+- PHPUnit `Scenarios` testsuite in `phpunit.xml`
+- Removed legacy root docs (`wallet-package-IMPLEMENTATION.md`,
+  `wallet-package-TEST-SCENARIOS.md`, `wallet-package-USAGE.md`)
+
 ## v13.1.0 — 2026-09-24
 
 Core hardening & correctness release. No new public features; financial

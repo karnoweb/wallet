@@ -2,7 +2,7 @@
 
 namespace Karnoweb\Wallet\Services;
 
-use Illuminate\Support\Facades\DB;
+use Karnoweb\Wallet\Support\AtomicWalletTransaction;
 use Karnoweb\Wallet\Enums\CreditExpireAction;
 use Karnoweb\Wallet\Enums\WalletOperationType;
 use Karnoweb\Wallet\Enums\WalletSign;
@@ -84,20 +84,7 @@ class ExpirationService
             'action' => $credit->expire_action->value,
         ];
 
-        $resolution = $this->idempotency->resolveOperation(
-            WalletOperationType::Expiration,
-            $payload,
-            $idempotencyKey,
-            true
-        );
-
-        if (! $resolution['is_new']) {
-            return false;
-        }
-
-        $operation = $resolution['operation'];
-
-        $result = DB::transaction(function () use ($credit, $operation) {
+        $result = AtomicWalletTransaction::run(function () use ($credit, $idempotencyKey, $payload) {
             $creditClass = ConfiguredModels::credit();
 
             /** @var WalletCredit $locked */
@@ -106,6 +93,23 @@ class ExpirationService
             if ($locked->remaining_amount <= 0) {
                 return null;
             }
+
+            if ($locked->expire_action === CreditExpireAction::None) {
+                return null;
+            }
+
+            $resolution = $this->idempotency->resolveOperation(
+                WalletOperationType::Expiration,
+                $payload,
+                $idempotencyKey,
+                true
+            );
+
+            if (! $resolution['is_new']) {
+                return null;
+            }
+
+            $operation = $resolution['operation'];
 
             return match ($locked->expire_action) {
                 CreditExpireAction::Burn => $this->burn($locked, $operation),
@@ -177,6 +181,7 @@ class ExpirationService
             ? $allocationClass::query()
                 ->where('wallet_transaction_id', $siblingDebit->id)
                 ->where('wallet_credit_id', $credit->parent_credit_id)
+                ->lockForUpdate()
                 ->first()
             : null;
 
@@ -185,6 +190,11 @@ class ExpirationService
                 "Cannot return expiring credit #{$credit->id}: the original source allocation could not be resolved."
             );
         }
+
+        // Lock parent credit before restore so remaining_amount updates
+        // serialize with concurrent spend/refund on the source wallet.
+        $creditClass = ConfiguredModels::credit();
+        $creditClass::query()->whereKey($credit->parent_credit_id)->lockForUpdate()->firstOrFail();
 
         $debitTransaction = ConfiguredModels::newTransaction();
         $debitTransaction->fill([

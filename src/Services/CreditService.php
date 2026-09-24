@@ -4,6 +4,8 @@ namespace Karnoweb\Wallet\Services;
 
 use Illuminate\Support\Collection;
 use Karnoweb\Wallet\DTOs\CreditRules;
+use Karnoweb\Wallet\Exceptions\InsufficientBalance;
+use Karnoweb\Wallet\Exceptions\WalletException;
 use Karnoweb\Wallet\Models\Wallet;
 use Karnoweb\Wallet\Models\WalletCredit;
 use Karnoweb\Wallet\Support\ConfiguredModels;
@@ -31,7 +33,8 @@ class CreditService
 {
     /**
      * Fetch already-filtered eligible candidate credits for a wallet,
-     * eager loading scopes to avoid N+1 checks per candidate.
+     * pushing remaining/date/cash/scope filters into SQL so wallets with
+     * thousands of credits do not load unrelated rows into PHP.
      */
     public function eligibleCandidates(
         Wallet $wallet,
@@ -56,11 +59,14 @@ class CreditService
             $query->where('cash_withdrawable', true);
         }
 
-        $candidates = $query->with('scopes')->get();
+        $this->applyClubScopeFilter($query, $clubId);
+        $this->applyServiceScopeFilter($query, $serviceIds);
 
-        return $candidates
-            ->filter(fn (WalletCredit $credit) => $this->matchesScopes($credit, $clubId, $serviceIds))
-            ->values();
+        return $query
+            ->with('scopes')
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get();
     }
 
     /**
@@ -88,7 +94,62 @@ class CreditService
             $query->where('cash_withdrawable', true);
         }
 
-        return $query->with('scopes')->get();
+        return $query
+            ->with('scopes')
+            ->orderBy('created_at')
+            ->orderBy('id')
+            ->get();
+    }
+
+    /**
+     * Credits with club scopes require the operation club to match; credits
+     * without club scopes are unrestricted. When the operation has no club,
+     * only unrestricted (no club scope) credits are eligible.
+     */
+    protected function applyClubScopeFilter($query, ?int $clubId): void
+    {
+        if ($clubId === null) {
+            $query->whereDoesntHave('scopes', function ($q) {
+                $q->where('scope_type', 'club');
+            });
+
+            return;
+        }
+
+        $query->where(function ($q) use ($clubId) {
+            $q->whereDoesntHave('scopes', function ($inner) {
+                $inner->where('scope_type', 'club');
+            })->orWhereHas('scopes', function ($inner) use ($clubId) {
+                $inner->where('scope_type', 'club')->where('scope_id', $clubId);
+            });
+        });
+    }
+
+    /**
+     * Credits with service scopes require at least one overlapping service
+     * id on the segment; credits without service scopes are unrestricted.
+     * When the segment provides no service ids, only unrestricted credits
+     * are eligible.
+     */
+    protected function applyServiceScopeFilter($query, array $serviceIds): void
+    {
+        $serviceIds = array_values(array_unique(array_map('intval', $serviceIds)));
+
+        if ($serviceIds === []) {
+            $query->whereDoesntHave('scopes', function ($q) {
+                $q->where('scope_type', 'service');
+            });
+
+            return;
+        }
+
+        $query->where(function ($q) use ($serviceIds) {
+            $q->whereDoesntHave('scopes', function ($inner) {
+                $inner->where('scope_type', 'service');
+            })->orWhereHas('scopes', function ($inner) use ($serviceIds) {
+                $inner->where('scope_type', 'service')->whereIn('scope_id', $serviceIds);
+            });
+        });
     }
 
     public function unscopedIsEligible(WalletCredit $credit, bool $requireCashWithdrawable, \DateTimeInterface $at): bool
@@ -164,22 +225,27 @@ class CreditService
     }
 
     /**
-     * Lock the given credit ids for update so allocation cannot race with
-     * another concurrent operation, then re-check eligibility criteria
-     * that could have changed since the candidates were selected.
+     * Lock the given credit ids for update in ascending id order so
+     * concurrent operations that touch overlapping credit sets cannot
+     * deadlock, then return the locked rows keyed by id.
      *
      * @return Collection<int, WalletCredit> Keyed by credit id.
      */
     public function lockCredits(array $creditIds): Collection
     {
-        if (empty($creditIds)) {
+        $creditIds = array_values(array_unique(array_filter($creditIds)));
+
+        if ($creditIds === []) {
             return collect();
         }
+
+        sort($creditIds);
 
         $creditClass = ConfiguredModels::credit();
 
         return $creditClass::query()
             ->whereIn('id', $creditIds)
+            ->orderBy('id')
             ->lockForUpdate()
             ->get()
             ->keyBy('id');
@@ -225,13 +291,44 @@ class CreditService
 
     public function increaseRemaining(WalletCredit $credit, int $amount): void
     {
-        $credit->remaining_amount += $amount;
-        $credit->save();
+        if ($amount <= 0) {
+            throw new WalletException('Increase amount must be greater than zero.');
+        }
+
+        $creditClass = ConfiguredModels::credit();
+
+        /** @var WalletCredit $fresh */
+        $fresh = $creditClass::query()->whereKey($credit->id)->lockForUpdate()->firstOrFail();
+
+        if ($fresh->remaining_amount + $amount > $fresh->original_amount) {
+            throw new WalletException(
+                "Cannot restore {$amount} to credit #{$credit->id}: remaining would exceed original_amount."
+            );
+        }
+
+        $fresh->remaining_amount += $amount;
+        $fresh->save();
+
+        $credit->setRawAttributes($fresh->getAttributes(), true);
     }
 
     public function decreaseRemaining(WalletCredit $credit, int $amount): void
     {
-        $credit->remaining_amount -= $amount;
-        $credit->save();
+        if ($amount <= 0) {
+            throw new WalletException('Decrease amount must be greater than zero.');
+        }
+
+        $creditClass = ConfiguredModels::credit();
+
+        $affected = $creditClass::query()
+            ->whereKey($credit->id)
+            ->where('remaining_amount', '>=', $amount)
+            ->decrement('remaining_amount', $amount);
+
+        if ($affected === 0) {
+            throw InsufficientBalance::forAmount($amount, (int) $credit->fresh()->remaining_amount);
+        }
+
+        $credit->refresh();
     }
 }

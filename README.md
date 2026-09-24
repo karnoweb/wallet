@@ -84,11 +84,27 @@ club/branch scoping, custom resolvers and strategies, reports and events — is 
 
 ## Testing
 
+Default suite (SQLite in-memory — Unit + Feature):
+
 ```bash
 composer test
 # or
 vendor/bin/phpunit
 ```
+
+Concurrency suite (MySQL / MariaDB / PostgreSQL only — real multi-process row locking):
+
+```bash
+# PowerShell
+$env:WALLET_TEST_CONCURRENCY_DSN="mysql://root:@127.0.0.1:3306/wallet_concurrency"
+vendor\bin\phpunit --testsuite=Concurrency
+
+# bash
+WALLET_TEST_CONCURRENCY_DSN=mysql://root:@127.0.0.1:3306/wallet_concurrency \
+  vendor/bin/phpunit --testsuite=Concurrency
+```
+
+Without `WALLET_TEST_CONCURRENCY_DSN`, concurrency tests are skipped (SQLite cannot prove row-level locking across processes).
 
 ## License
 

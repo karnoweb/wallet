@@ -26,10 +26,25 @@ class BalanceService
     {
         $transactionClass = ConfiguredModels::transaction();
 
+        // MySQL stores amount as UNSIGNED; `amount * sign` overflows when
+        // sign is -1. Cast to signed so debit rows contribute negatively
+        // on MySQL/MariaDB while SQLite/Postgres keep the simple form.
+        $aggregate = $this->balanceAggregateExpression();
+
         return (int) $transactionClass::query()
             ->where('wallet_id', $wallet->id)
-            ->selectRaw('COALESCE(SUM(amount * sign), 0) as aggregate_balance')
+            ->selectRaw("{$aggregate} as aggregate_balance")
             ->value('aggregate_balance');
+    }
+
+    protected function balanceAggregateExpression(): string
+    {
+        $driver = \Illuminate\Support\Facades\DB::connection()->getDriverName();
+
+        return match ($driver) {
+            'mysql' => 'COALESCE(SUM(CAST(amount AS SIGNED) * sign), 0)',
+            default => 'COALESCE(SUM(amount * sign), 0)',
+        };
     }
 
     /**

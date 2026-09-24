@@ -5,7 +5,7 @@ namespace Karnoweb\Wallet\Services;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Support\Facades\DB;
+use Karnoweb\Wallet\Support\AtomicWalletTransaction;
 use Karnoweb\Wallet\DTOs\CreditRules;
 use Karnoweb\Wallet\DTOs\WalletContext;
 use Karnoweb\Wallet\DTOs\WalletOperationResult;
@@ -83,7 +83,7 @@ class WalletOwnerManager
      */
     protected function createWalletWithLock(): Wallet
     {
-        return DB::transaction(function () {
+        return AtomicWalletTransaction::run(function () {
             $ownerClass = get_class($this->owner);
 
             $ownerClass::query()->whereKey($this->owner->getKey())->lockForUpdate()->first();

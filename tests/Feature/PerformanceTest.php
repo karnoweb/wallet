@@ -64,9 +64,11 @@ class PerformanceTest extends TestCase
         $count = count(DB::getQueryLog());
         DB::disableQueryLog();
 
-        // Bounded: candidate query + scopes eager load + lock + a handful
-        // of writes, not one extra round-trip per credit/scope.
-        $this->assertLessThan(20, $count);
+        // Candidate selection stays O(1) SQL round-trips (filter in DB +
+        // eager scopes + lock). Per-credit writes (allocation insert +
+        // remaining decrement) scale with consumed credits, not with the
+        // total number of unrelated credits/scopes on the wallet.
+        $this->assertLessThan(35, $count);
     }
 
     /** PF004 */

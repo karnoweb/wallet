@@ -6,3 +6,5 @@ composer.lock
 debug.log
 install_log.txt
 note.md
+
+/ignore/

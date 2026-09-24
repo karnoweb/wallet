@@ -2,7 +2,7 @@
 
 namespace Karnoweb\Wallet\Services;
 
-use Illuminate\Support\Facades\DB;
+use Karnoweb\Wallet\Support\AtomicWalletTransaction;
 use InvalidArgumentException;
 use Karnoweb\Wallet\DTOs\CreditRules;
 use Karnoweb\Wallet\DTOs\WalletContext;
@@ -48,20 +48,24 @@ class ChargeService
             'rules' => $rules->toArray(),
         ];
 
-        $resolution = $this->idempotency->resolveOperation(
-            WalletOperationType::Charge,
-            $payload,
-            $context->idempotencyKey,
-            (bool) ($settings['idempotency_required'] ?? false)
-        );
+        $result = AtomicWalletTransaction::run(function () use ($wallet, $amount, $context, $settings, $rules, $payload) {
+            $resolution = $this->idempotency->resolveOperation(
+                WalletOperationType::Charge,
+                $payload,
+                $context->idempotencyKey,
+                (bool) ($settings['idempotency_required'] ?? false)
+            );
 
-        if (! $resolution['is_new']) {
-            return $this->existingTransaction($resolution['operation']->id);
-        }
+            if (! $resolution['is_new']) {
+                return [
+                    'transaction' => $this->existingTransaction($resolution['operation']->id),
+                    'credit' => null,
+                    'replay' => true,
+                ];
+            }
 
-        $operation = $resolution['operation'];
+            $operation = $resolution['operation'];
 
-        $result = DB::transaction(function () use ($wallet, $amount, $context, $settings, $rules, $operation) {
             $transaction = ConfiguredModels::newTransaction();
             $transaction->fill([
                 'wallet_id' => $wallet->id,
@@ -96,10 +100,16 @@ class ChargeService
 
             $this->credits->createScopesFromRules($credit, $rules);
 
-            return ['transaction' => $transaction, 'credit' => $credit];
+            return [
+                'transaction' => $transaction,
+                'credit' => $credit,
+                'replay' => false,
+            ];
         });
 
-        event(new WalletCharged($result['transaction'], $result['credit']));
+        if (! $result['replay']) {
+            event(new WalletCharged($result['transaction'], $result['credit']));
+        }
 
         return $result['transaction'];
     }

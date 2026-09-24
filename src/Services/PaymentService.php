@@ -2,7 +2,7 @@
 
 namespace Karnoweb\Wallet\Services;
 
-use Illuminate\Support\Facades\DB;
+use Karnoweb\Wallet\Support\AtomicWalletTransaction;
 use InvalidArgumentException;
 use Karnoweb\Wallet\DTOs\SpendSegment;
 use Karnoweb\Wallet\DTOs\WalletContext;
@@ -40,20 +40,24 @@ class PaymentService
 
         $payload = $this->buildPayload($wallet, $amount, $context, $segments);
 
-        $resolution = $this->idempotency->resolveOperation(
-            WalletOperationType::Payment,
-            $payload,
-            $context->idempotencyKey,
-            (bool) ($settings['idempotency_required'] ?? false)
-        );
+        $result = AtomicWalletTransaction::run(function () use ($wallet, $amount, $context, $settings, $segments, $payload) {
+            $resolution = $this->idempotency->resolveOperation(
+                WalletOperationType::Payment,
+                $payload,
+                $context->idempotencyKey,
+                (bool) ($settings['idempotency_required'] ?? false)
+            );
 
-        if (! $resolution['is_new']) {
-            return $this->existingTransaction($resolution['operation']->id);
-        }
+            if (! $resolution['is_new']) {
+                return [
+                    'transaction' => $this->existingTransaction($resolution['operation']->id),
+                    'allocations' => null,
+                    'replay' => true,
+                ];
+            }
 
-        $operation = $resolution['operation'];
+            $operation = $resolution['operation'];
 
-        $result = DB::transaction(function () use ($wallet, $amount, $context, $settings, $segments, $operation) {
             $transaction = ConfiguredModels::newTransaction();
             $transaction->fill([
                 'wallet_id' => $wallet->id,
@@ -93,10 +97,16 @@ class PaymentService
                 $allAllocations = $allAllocations->merge($segmentResult['allocations']);
             }
 
-            return ['transaction' => $transaction, 'allocations' => $allAllocations];
+            return [
+                'transaction' => $transaction,
+                'allocations' => $allAllocations,
+                'replay' => false,
+            ];
         });
 
-        event(new WalletPaid($result['transaction'], $result['allocations']));
+        if (! $result['replay']) {
+            event(new WalletPaid($result['transaction'], $result['allocations']));
+        }
 
         return $result['transaction'];
     }

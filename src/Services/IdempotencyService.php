@@ -3,6 +3,7 @@
 namespace Karnoweb\Wallet\Services;
 
 use Illuminate\Database\QueryException;
+use Illuminate\Database\UniqueConstraintViolationException;
 use Karnoweb\Wallet\Enums\WalletOperationType;
 use Karnoweb\Wallet\Exceptions\IdempotencyConflict;
 use Karnoweb\Wallet\Models\WalletOperation;
@@ -12,10 +13,15 @@ use Karnoweb\Wallet\Support\ConfiguredModels;
  * Guarantees that retried financial requests never produce duplicate
  * financial effects.
  *
- * Every call site MUST call {@see resolveOperation()} before doing any
- * financial write. When the returned result is not "new", the caller
- * MUST skip all financial writes and instead return the transaction(s)
- * already attached to the returned operation.
+ * Call sites MUST invoke {@see resolveOperation()} inside the same
+ * database transaction that performs the financial writes. Creating the
+ * operation outside that transaction would leave an orphan row when the
+ * financial work rolls back, and a retry with the same key would then
+ * fail looking up non-existent transactions.
+ *
+ * When the returned result is not "new", the caller MUST skip all
+ * financial writes and return the transaction(s) already attached to
+ * the returned operation.
  */
 class IdempotencyService
 {
@@ -50,9 +56,7 @@ class IdempotencyService
             ->first();
 
         if ($existing) {
-            $this->assertPayloadMatches($existing, $type, $idempotencyKey, $hash);
-
-            return ['operation' => $existing, 'is_new' => false];
+            return $this->reuseOrReclaim($existing, $type, $idempotencyKey, $hash);
         }
 
         try {
@@ -60,23 +64,74 @@ class IdempotencyService
                 'operation' => $this->createOperation($type, $idempotencyKey, $hash),
                 'is_new' => true,
             ];
-        } catch (QueryException $e) {
+        } catch (UniqueConstraintViolationException|QueryException $e) {
             // Lost a race against a concurrent request creating the same
-            // (type, idempotency_key) row. Reload and validate instead of
-            // failing the request.
-            $existing = $operationClass::query()
-                ->where('type', $type)
-                ->where('idempotency_key', $idempotencyKey)
-                ->first();
+            // (type, idempotency_key) row. Under READ COMMITTED (see
+            // AtomicWalletTransaction) a plain SELECT sees the winner.
+            $existing = $this->waitForExistingOperation($operationClass, $type, $idempotencyKey);
 
             if (! $existing) {
                 throw $e;
             }
 
-            $this->assertPayloadMatches($existing, $type, $idempotencyKey, $hash);
+            return $this->reuseOrReclaim($existing, $type, $idempotencyKey, $hash);
+        }
+    }
 
+    protected function waitForExistingOperation(string $operationClass, string $type, string $idempotencyKey): ?WalletOperation
+    {
+        for ($attempt = 0; $attempt < 5; $attempt++) {
+            $existing = $operationClass::query()
+                ->where('type', $type)
+                ->where('idempotency_key', $idempotencyKey)
+                ->first();
+
+            if ($existing) {
+                return $existing;
+            }
+
+            usleep(20_000);
+        }
+
+        return null;
+    }
+
+    /**
+     * Reuse a completed operation, or reclaim an orphan row left by a
+     * pre-hardening deployment that created the operation outside the
+     * financial transaction.
+     *
+     * @return array{operation: WalletOperation, is_new: bool}
+     */
+    protected function reuseOrReclaim(
+        WalletOperation $existing,
+        string $type,
+        string $idempotencyKey,
+        string $hash
+    ): array {
+        $this->assertPayloadMatches($existing, $type, $idempotencyKey, $hash);
+
+        if ($this->operationHasEffects($existing)) {
             return ['operation' => $existing, 'is_new' => false];
         }
+
+        // Orphan: key claimed but no financial rows. Safe to delete and
+        // recreate so a legitimate retry can proceed.
+        $existing->delete();
+
+        return [
+            'operation' => $this->createOperation($type, $idempotencyKey, $hash),
+            'is_new' => true,
+        ];
+    }
+
+    protected function operationHasEffects(WalletOperation $operation): bool
+    {
+        $transactionClass = ConfiguredModels::transaction();
+
+        return $transactionClass::query()
+            ->where('operation_id', $operation->id)
+            ->exists();
     }
 
     protected function assertPayloadMatches(WalletOperation $existing, string $type, string $idempotencyKey, string $hash): void

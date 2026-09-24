@@ -180,7 +180,10 @@ class AllocationService
         ]);
         $allocation->save();
 
-        $this->credits->increaseRemaining($originalAllocation->credit, $amount);
+        // Load (or refresh) the credit under the caller's locks rather than
+        // trusting a possibly stale eager-loaded relation.
+        $credit = $originalAllocation->credit()->firstOrFail();
+        $this->credits->increaseRemaining($credit, $amount);
 
         return $allocation;
     }

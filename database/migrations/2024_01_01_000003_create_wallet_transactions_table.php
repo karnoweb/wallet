@@ -25,7 +25,15 @@ return new class extends Migration
             $table->smallInteger('sign');
             $table->string('type', 32);
 
-            $table->nullableMorphs('transactionable');
+            // Explicit morph columns + short index name: Laravel's
+            // nullableMorphs() auto-index exceeds MySQL's 64-char limit
+            // (`wallet_transactions_transactionable_type_transactionable_id_index`).
+            $table->string('transactionable_type')->nullable();
+            $table->unsignedBigInteger('transactionable_id')->nullable();
+            $table->index(
+                ['transactionable_type', 'transactionable_id'],
+                'wallet_tx_transactionable_index'
+            );
 
             $table->text('description')->nullable();
 

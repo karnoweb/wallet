@@ -2,7 +2,7 @@
 
 namespace Karnoweb\Wallet\Services;
 
-use Illuminate\Support\Facades\DB;
+use Karnoweb\Wallet\Support\AtomicWalletTransaction;
 use InvalidArgumentException;
 use Karnoweb\Wallet\DTOs\WalletContext;
 use Karnoweb\Wallet\DTOs\WalletOperationResult;
@@ -51,20 +51,27 @@ class TransferService
             'transaction_id' => $context->transactionId,
         ];
 
-        $resolution = $this->idempotency->resolveOperation(
-            WalletOperationType::Transfer,
-            $payload,
-            $context->idempotencyKey,
-            (bool) ($settings['idempotency_required'] ?? false)
-        );
+        $result = AtomicWalletTransaction::run(function () use ($source, $destination, $amount, $context, $settings, $payload) {
+            $this->lockWalletsDeterministically($source, $destination);
 
-        if (! $resolution['is_new']) {
-            return $this->existingResult($resolution['operation']);
-        }
+            $resolution = $this->idempotency->resolveOperation(
+                WalletOperationType::Transfer,
+                $payload,
+                $context->idempotencyKey,
+                (bool) ($settings['idempotency_required'] ?? false)
+            );
 
-        $operation = $resolution['operation'];
+            if (! $resolution['is_new']) {
+                return [
+                    'result' => $this->existingResult($resolution['operation']),
+                    'sourceAllocations' => null,
+                    'destinationCredits' => null,
+                    'replay' => true,
+                ];
+            }
 
-        $result = DB::transaction(function () use ($source, $destination, $amount, $context, $settings, $operation) {
+            $operation = $resolution['operation'];
+
             $sourceTransaction = ConfiguredModels::newTransaction();
             $sourceTransaction->fill([
                 'wallet_id' => $source->id,
@@ -132,21 +139,38 @@ class TransferService
             }
 
             return [
-                'sourceTransaction' => $sourceTransaction,
-                'destinationTransaction' => $destinationTransaction,
+                'result' => new WalletOperationResult($operation, $sourceTransaction, $destinationTransaction),
                 'sourceAllocations' => $segmentResult['allocations'],
                 'destinationCredits' => $destinationCredits,
+                'replay' => false,
             ];
         });
 
-        event(new WalletTransferred(
-            $result['sourceTransaction'],
-            $result['destinationTransaction'],
-            $result['sourceAllocations'],
-            $result['destinationCredits']
-        ));
+        if (! $result['replay']) {
+            event(new WalletTransferred(
+                $result['result']->sourceTransaction,
+                $result['result']->destinationTransaction,
+                $result['sourceAllocations'],
+                $result['destinationCredits']
+            ));
+        }
 
-        return new WalletOperationResult($operation, $result['sourceTransaction'], $result['destinationTransaction']);
+        return $result['result'];
+    }
+
+    /**
+     * Lock both wallet rows in ascending primary-key order so concurrent
+     * A→B and B→A transfers cannot deadlock on wallet locks.
+     */
+    protected function lockWalletsDeterministically(Wallet $source, Wallet $destination): void
+    {
+        $walletClass = ConfiguredModels::wallet();
+
+        $ids = collect([$source->id, $destination->id])->unique()->sort()->values();
+
+        foreach ($ids as $id) {
+            $walletClass::query()->whereKey($id)->lockForUpdate()->firstOrFail();
+        }
     }
 
     protected function existingResult(\Karnoweb\Wallet\Models\WalletOperation $operation): WalletOperationResult
